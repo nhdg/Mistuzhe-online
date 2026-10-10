@@ -6,8 +6,8 @@ const path = require("path");
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server, maxPayload: 16 * 1024 });
-app.use(express.static(path.join(__dirname, "public")));
+const wss = new WebSocket.Server({ server, maxPayload: 16 * 1024 })
+app.use(express.static(__dirname));
 app.get("/health", (_, res) => res.json({ ok: true, name: "迷途者", version: "2.0.0" }));
 
 const rooms = new Map();
