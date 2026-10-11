@@ -44,12 +44,12 @@ const log = (room,s) => {room.logs.push(s);room.logs=room.logs.slice(-70);};
 const note = (p,s) => {p.notices.push(s);p.notices=p.notices.slice(-8);};
 const draw = (p,n=1) => {for(let i=0;i<n;i++)p.hand.push(RESOURCE_CARDS[rand(RESOURCE_CARDS.length)]);};
 const makeGoal = g => ({id:g[0],name:g[1],desc:g[2],points:g[3],kind:g[4],progress:0,done:false});
-function makeRoom(name, ws) {
+function makeRoom(name, ws, mode="human") {
   const board=Array.from({length:64},(_,i)=>({i,t:rand(8),blocked:false,trap:null,seenBy:[]}));
   // Ensure a recognizable central zone and balanced starting corners.
   for(let r=2;r<=5;r++)for(let c=2;c<=5;c++)board[r*8+c].t=2;
   board[0].t=6;board[7].t=1;board[56].t=3;board[63].t=7;
-  const room={code:crypto.randomBytes(3).toString("hex").toUpperCase(),board,players:[],round:1,safe:0,phase:"lobby",current:0,turns:0,logs:["房间已创建。把房间码分享给朋友即可联机。"],revealUntil:0,poker:null,createdAt:Date.now()};
+  const room={code:crypto.randomBytes(3).toString("hex").toUpperCase(),mode,board,players:[],round:1,safe:0,phase:"lobby",current:0,turns:0,logs:["房间已创建。把房间码分享给朋友即可联机。"],revealUntil:0,poker:null,createdAt:Date.now()};
   rooms.set(room.code,room);addPlayer(room,name,ws);return room;
 }
 function addPlayer(room,name,ws) {
@@ -234,12 +234,43 @@ function startPoker(room,p){
   p.secretActions++;setTimeout(()=>{if(room.poker?.id===pokerId){room.poker=null;broadcast(room);}},12000);
   note(p,`你的牌型：${sa.label}。对手牌型：${sb.label}。`);note(opp,`你的牌型：${sb.label}。对手牌型：${sa.label}。`);
 }
+function scheduleBotTurn(room, delay=650) {
+  if (!room || room.mode!=="ai" || room.phase!=="play") return;
+  const bot=room.players[room.current];
+  if (!bot?.isBot) return;
+  setTimeout(()=>runBotTurn(room,bot),delay);
+}
+function runBotTurn(room,bot) {
+  if (!rooms.has(room.code) || room.phase!=="play" || room.players[room.current]!==bot) return;
+  act(room,bot,{type:"roll"});
+  if (room.phase!=="play" || room.players[room.current]!==bot) return;
+  // Choose a legal straight-line destination, preferring exploration and the safe zone.
+  const candidates=[];
+  for(let i=0;i<64;i++){
+    if(i===bot.pos||room.board[i].blocked)continue;
+    const a=pos(bot.pos),b=pos(i),d=dist(bot.pos,i);
+    if(d>bot.actions||!(a.r===b.r||a.c===b.c))continue;
+    let r=a.r,c=a.c,dr=Math.sign(b.r-a.r),dc=Math.sign(b.c-a.c),valid=true;
+    for(let k=1;k<=d;k++){r+=dr;c+=dc;if(room.board[r*8+c].blocked){valid=false;break;}}
+    if(valid)candidates.push({i,d,score:(room.board[i].seenBy.includes(bot.id)?0:4)+(safe(room,i)?3:-4)+(room.board[i].t===3?2:0)+(room.board[i].t===1?1:0)-d*.15+Math.random()});
+  }
+  candidates.sort((a,b)=>b.score-a.score);
+  const choice=candidates[0];
+  if(choice)act(room,bot,{type:"move",cell:choice.i});
+  // Occasionally use a simple beneficial card, otherwise end the turn reliably.
+  if(room.phase==="play"&&room.players[room.current]===bot&&bot.rolled&&bot.actions>0){
+    const potion=bot.hand.indexOf("药剂");
+    if(potion>=0&&bot.hp<=9)act(room,bot,{type:"useCard",cardIndex:potion});
+  }
+  if(room.phase==="play"&&room.players[room.current]===bot&&bot.rolled)act(room,bot,{type:"endTurn"});
+}
+
 function act(room,p,msg){
   if(!room.players.includes(p))return;
   const opponent=()=>room.players.find(x=>x.id!==p.id);
   if(msg.type==="start"&&room.phase==="lobby"&&room.players.length===2&&room.players[0]===p){
     room.phase="reveal";room.revealUntil=Date.now()+8000;log(room,"地图公开 8 秒：记忆地形后开始。");broadcast(room);
-    setTimeout(()=>{if(room.phase==="reveal"){room.phase="play";room.current=rand(2);room.players.forEach(x=>{x.rolled=false;x.actions=0;});log(room,`记忆阶段结束，${room.players[room.current].name} 先行动。`);broadcast(room);}},8000);
+    setTimeout(()=>{if(room.phase==="reveal"){room.phase="play";room.current=rand(2);room.players.forEach(x=>{x.rolled=false;x.actions=0;});log(room,`记忆阶段结束，${room.players[room.current].name} 先行动。`);broadcast(room);scheduleBotTurn(room);}},8000);
   } else if(msg.type==="roll"&&room.phase==="play"&&room.players[room.current]===p&&!p.rolled){
     p.lastDice=1+rand(6);p.actions=p.blinded?Math.max(1,Math.ceil(p.lastDice/2)):p.lastDice;if(p.blinded)p.blinded=false;p.rolled=true;log(room,`${p.name} 掷出 ${p.lastDice}，获得 ${p.actions} 点行动力。`);
   } else if(msg.type==="move"&&room.phase==="play"&&room.players[room.current]===p&&p.rolled){
@@ -260,7 +291,7 @@ function act(room,p,msg){
   } else if(msg.type==="transfer"&&room.phase==="play"&&room.players[room.current]===p&&p.transfer){
     const i=Number(msg.targetIndex),g=p.targets[i];if(g&&!g.done){const options=GOALS.filter(x=>!p.targets.some(t=>t.id===x[0]));if(options.length){p.targets[i]=makeGoal(pick(options)[0]);p.transfer=false;log(room,`${p.name} 使用转移卡更换了目标。`);}}
   } else if(msg.type==="poker"&&room.phase==="play"&&room.players[room.current]===p&&p.rolled){if(room.board[p.pos].t!==6)note(p,"德国扑克桌设在草地格，请先移动到草地。");else if(p.actions<1)note(p,"挑战德国扑克需要 1 点行动力。");else{p.actions--;startPoker(room,p);}}
-  else if(msg.type==="endTurn"&&room.phase==="play"&&room.players[room.current]===p&&p.rolled){finishTurn(room,p);if(room.phase!=="over")log(room,`${room.players[room.current].name} 的回合开始。`);return;}
+  else if(msg.type==="endTurn"&&room.phase==="play"&&room.players[room.current]===p&&p.rolled){finishTurn(room,p);if(room.phase!=="over"){log(room,`${room.players[room.current].name} 的回合开始。`);broadcast(room);scheduleBotTurn(room);}return;}
   broadcast(room);
 }
 wss.on("connection",ws=>{
@@ -272,7 +303,7 @@ wss.on("connection",ws=>{
       const name=String(msg.name||"旅人").trim().slice(0,18)||"旅人",code=String(msg.roomCode||"").trim().toUpperCase(),token=String(msg.token||"");
       if(code&&token){const existing=rooms.get(code)?.players.find(x=>x.token===token);if(existing){room=rooms.get(code);player=existing;player.ws=ws;send(ws,{type:"joined",roomCode:room.code,playerId:player.id,token:player.token});broadcast(room);return;}}
       if(code){room=rooms.get(code);if(!room){send(ws,{type:"error",message:"房间码不存在。"});return;}if(room.players.length>=2){send(ws,{type:"error",message:"房间已满。"});return;}if(room.phase!=="lobby"){send(ws,{type:"error",message:"游戏已开始，不能中途加入。"});return;}player=addPlayer(room,name,ws);}
-      else{room=makeRoom(name,ws);player=room.players[0];}
+      else{const mode=msg.mode==="ai"?"ai":"human";room=makeRoom(name,ws,mode);player=room.players[0];if(mode==="ai"){const bot=addPlayer(room,"迷途电脑",null);bot.isBot=true;bot.token="BOT";log(room,"人机模式已开启：电脑旅人加入了对局。");}}
       send(ws,{type:"joined",roomCode:room.code,playerId:player.id,token:player.token});log(room,`${player.name} 加入房间。`);broadcast(room);return;
     }
     if(room&&player)act(room,player,msg);
